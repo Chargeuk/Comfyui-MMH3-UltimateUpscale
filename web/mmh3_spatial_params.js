@@ -68,6 +68,27 @@ app.registerExtension({
         const origConfigure = node.onConfigure;
         node.onConfigure = function () {
             const res = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+            const values = arguments[0]?.widgets_values;
+            if ((node.comfyClass || node.type) === "MMH3SpatialSplitParams" && Array.isArray(values)) {
+                // LD saved joint controls immediately after overlap_blend, before
+                // upstream added four sequential-only controls at those positions.
+                if ((values.length === 15 || values.length === 16) && typeof values[14] === "boolean") {
+                    const defaults = { masked_area_noise: 0, brightness_match: false, dynamic_fade: "off", dynamic_fade_min: 32 };
+                    for (const [name, value] of Object.entries(defaults)) {
+                        const widget = findWidget(node, name);
+                        if (widget) widget.value = value;
+                    }
+                    const joint = findWidget(node, "joint_steps");
+                    const budget = findWidget(node, "token_budget");
+                    if (joint) joint.value = values[14];
+                    if (budget && typeof values[15] === "number") budget.value = values[15];
+                } else if (values.length === 18 && typeof values[14] === "number") {
+                    // Workflows saved by upstream predate joint sampling and
+                    // must continue using the sequential path when reopened.
+                    const joint = findWidget(node, "joint_steps");
+                    if (joint) joint.value = false;
+                }
+            }
             setTimeout(() => applyMode(node), 0);
             return res;
         };
