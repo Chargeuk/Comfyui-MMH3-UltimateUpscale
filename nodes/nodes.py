@@ -1895,7 +1895,7 @@ class MMH3UltimateUpscale(io.ComfyNode):
                 negative=None, cfg=1.0,
                 temporal_split_param=None, spatial_split_param=None,
                 latent_upscale_param=None, fun_control_param=None,
-                inpaint_param=None) -> io.NodeOutput:
+                inpaint_param=None, offload_diffusion=True) -> io.NodeOutput:
         samples = latent["samples"]
         if not is_h3_av_latent(samples):
             raise ValueError("MMH3UltimateUpscale expects a MiniMax H3 AV latent (nested video [B,24,T,H,W] + audio [B,32,2,T])")
@@ -1975,7 +1975,8 @@ class MMH3UltimateUpscale(io.ComfyNode):
             upscaled = False
             if latent_upscale_param is not None:
                 use_model = "model_name" in latent_upscale_param
-                if (use_model and not keep_upscaler_resident
+                # Embedded callers may keep the same patcher resident when memory permits.
+                if (offload_diffusion and use_model and not keep_upscaler_resident
                         and str(latent_upscale_param["device"]) == "cuda" and hasattr(model, "clone_base_uuid")):
                     # the 3D upscaler is on the GPU during upscale; offload the
                     # diffusion model so they don't reside simultaneously
@@ -2058,7 +2059,7 @@ class MMH3UltimateUpscale(io.ComfyNode):
 
         # all chunks sampled & stitched: the diffusion model is no longer needed,
         # unload it so the caller (e.g. VAE decode of the large latent) gets the VRAM
-        if hasattr(model, "clone_base_uuid"):
+        if offload_diffusion and hasattr(model, "clone_base_uuid"):
             comfy.model_management.unload_model_and_clones(model, unload_additional_models=False)
             comfy.model_management.soft_empty_cache()
 
