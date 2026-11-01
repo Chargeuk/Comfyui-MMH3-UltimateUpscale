@@ -39,8 +39,11 @@ function applyMode(node) {
     const mode = findWidget(node, MODE_WIDGET);
     if (!mode) return false;
     const rowsCols = mode.value === "rows_cols";
-    for (const name of SPECIFIC_WIDGETS) setWidgetVisible(node, name, !rowsCols);
-    for (const name of GRID_WIDGETS) setWidgetVisible(node, name, rowsCols);
+    const isH3 = (node.comfyClass || node.type) === "MMH3SpatialSplitParams";
+    const auto = isH3 && mode.value === "auto";
+    for (const name of SPECIFIC_WIDGETS) setWidgetVisible(node, name, !rowsCols && !auto);
+    for (const name of GRID_WIDGETS) setWidgetVisible(node, name, rowsCols && (!isH3 || !name.startsWith("upscale_")));
+    if (isH3) setWidgetVisible(node, "token_budget", auto);
     if (node.onResize) node.onResize(node.size);
     app.graph.setDirtyCanvas(true, true);
     return true;

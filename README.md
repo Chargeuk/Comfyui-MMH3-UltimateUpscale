@@ -1,5 +1,15 @@
 # Comfyui-MMH3-UltimateUpscale
 
+
+> This fork adds the LD MiniMax H3 joint tiled sampler and automatic token-budget
+> tile sizing. The spatial parameter node resolves `rows_cols` and `auto` against
+> the actual chunk at sampling time; its tile size outputs are placeholders in
+> those modes. `joint_steps` merges tile results at every sampling step. Fun
+> ControlNet, spatial inpainting, masked-area noise, brightness matching, and
+> dynamic fade use the upstream sequential path instead. LTX nodes retain the
+> upstream implementation. Test model and sampler compatibility before use in
+> a production workflow.
+
 **Upscale long, high-resolution MiniMax H3 video on a VRAM-limited GPU — in a single node.**
 
 This node re-samples (enhances / upscales) an already-denoised MiniMax H3 AV latent through the full auto pipeline **under tight VRAM constraints**: it processes the clip with **temporal chunking (so arbitrarily long videos fit in memory) + spatial tiling (so arbitrarily high resolutions fit in memory)**, keeping **peak VRAM bounded to a single tile**, while preserving the audio track intact.

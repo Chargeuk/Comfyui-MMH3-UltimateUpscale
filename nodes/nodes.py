@@ -418,6 +418,157 @@ def _solve_equal_tiles(total_px, count, base_overlap_px, granularity):
     return s, o
 
 
+def _solve_equal_tiles_ld(total_px, count, base_overlap_px, granularity):
+    """Solve (tile_px, overlap_px) so `count` tiles of EXACTLY equal size cover
+    total_px, edge tiles included: count*tile - (count-1)*overlap == total_px.
+
+    The solved overlap is a multiple of `granularity` (one latent token:
+    16px for MiniMax H3, 32px for LTX). `base_overlap_px` is the user's desired
+    overlap; the search starts from the smallest tile that honours it, so the
+    solved overlap lands as close to it as the divisibility constraints allow.
+    Returns (tile_px, overlap_px); raises ValueError if no solution exists."""
+    g = int(granularity)
+    if count <= 1:
+        return -(-int(total_px) // g) * g, 0
+    start = -(-((int(total_px) + (count - 1) * int(base_overlap_px)) // count) // g) * g
+    # s - overlap == (total - s) / (count - 1), so s is bounded from above too:
+    # every tile needs at least one token of non-overlapped content.
+    upper = int(total_px) - g * (count - 1)
+    if start > upper:
+        raise ValueError(
+            f"Cannot split {total_px}px into {count} equal tiles with "
+            f"{base_overlap_px}px overlap: tiles would have no unique content. "
+            f"Reduce the overlap or the tile count.")
+    for s in range(start, upper + 1, g):
+        num = count * s - int(total_px)
+        if num % (count - 1) == 0:
+            o = num // (count - 1)
+            if o % g == 0 and 0 <= o <= s - g:
+                return s, o
+    raise ValueError(
+        f"No equal-tile solution for {total_px}px / {count} tiles / overlap "
+        f"{base_overlap_px}px on a {g}px grid; adjust the overlap slightly.")
+
+
+TOKEN_CEILING = 74898
+
+def tokens_per_forward(tile_w_px, tile_h_px, video_tokens):
+    """Sequence length of ONE forward over a tile of this pixel size.
+
+    H3 patchifies a 2x2 block of 16px latent tokens, so a forward sees
+    (w/32) x (h/32) spatial positions for every video latent token in the
+    chunk. A 102-frame chunk is 30 video tokens, so a 2048x864 strip is
+    64 * 27 * 30 = 51,840.
+    """
+    return (int(tile_w_px) // 32) * (int(tile_h_px) // 32) * int(video_tokens)
+
+
+def solve_grid_for_budget(frame_w_px, frame_h_px, video_tokens,
+                          ol_w_px, ol_h_px, budget, min_tile_px, max_side=9):
+    """Fewest equal tiles whose per-tile forward fits `budget` tokens.
+
+    Fewest wins because every extra tile is another forward on every step.
+    Ties are broken towards splitting the LONGER frame axis, so a tall frame
+    comes out as horizontal strips rather than a checkerboard: 3x1 has two
+    seam lines, 2x2 has two plus a crossing where four tiles meet.
+
+    Returns (grid_rows, grid_cols, tile_w_px, tile_h_px, ol_w_px, ol_h_px),
+    or None if even a 9x9 grid cannot get under the budget.
+    """
+    for total in range(1, max_side * max_side + 1):
+        best = None
+        for gr in range(1, max_side + 1):
+            if total % gr:
+                continue
+            gc = total // gr
+            if gc > max_side:
+                continue
+            try:
+                twpx, owpx = _solve_equal_tiles_ld(frame_w_px, gc, ol_w_px, 32)
+                thpx, ohpx = _solve_equal_tiles_ld(frame_h_px, gr, ol_h_px, 32)
+            except ValueError:
+                continue
+            if twpx < min_tile_px or thpx < min_tile_px:
+                continue
+            if tokens_per_forward(twpx, thpx, video_tokens) > budget:
+                continue
+            long_split = gr if frame_h_px >= frame_w_px else gc
+            rank = (-long_split, abs(gr - gc))
+            if best is None or rank < best[0]:
+                best = (rank, gr, gc, twpx, thpx, owpx, ohpx)
+        if best is not None:
+            return best[1:]
+    return None
+
+
+def resolve_grid_on_frame(sp, w, h, t, ol_w, ol_h, min_tile):
+    """Re-solve the tile grid against the frame ACTUALLY in hand.
+
+    The params node solves its equal-tile grid from upscale_width/height,
+    because it runs before any latent exists and has nothing else to go on.
+    That turns those two widgets into a promise about a frame this node has
+    not seen, and a stale promise fails silently: a grid solved for 544x544
+    and applied to 832x1248 came out 7 rows x 2 cols when ONE column was
+    asked for, so a vertical seam appeared in a layout chosen to have none.
+
+    Here the actual chunk is in hand, so the promise is not needed.
+
+      rows_cols - the SHAPE is the setting: ask for 3 rows and 1 column and
+                  that is what you get at 1MP, at 5MP, at anything.
+      auto      - the SEQUENCE LENGTH is the setting: the shape is solved
+                  from it, so raising the megapixel dial adds tiles by
+                  itself instead of walking into the token ceiling.
+
+    All four values in and out are LATENT tokens (16px), which is what the
+    callers work in.
+    """
+    mode = str(sp.get("tile_size_mode") or "")
+    tw, th = None, None
+
+    if mode == "auto":
+        budget = int(sp.get("token_budget") or TOKEN_CEILING)
+        got = solve_grid_for_budget(w * 16, h * 16, t, ol_w * 16, ol_h * 16,
+                                    budget, min_tile * 16)
+        if got is None:
+            raise ValueError(
+                "auto tiling: no grid up to 9x9 fits %d tokens on a %dx%dpx "
+                "frame of %d video tokens (min_tile_size %dpx). Raise "
+                "token_budget, lower min_tile_size, or shorten the temporal "
+                "chunk." % (budget, w * 16, h * 16, t, min_tile * 16))
+        _gr, _gc, _twpx, _thpx, _owpx, _ohpx = got
+        seq = tokens_per_forward(_twpx, _thpx, t)
+        whole = tokens_per_forward(w * 16, h * 16, t)
+        print("[MMH3] auto tiling on the real frame %dx%dpx (%d video tokens): "
+              "%dx%d grid, tiles %dx%dpx, overlap w=%d h=%d | %d tokens per "
+              "forward vs %d whole-frame, budget %d"
+              % (w * 16, h * 16, t, _gr, _gc, _twpx, _thpx, _owpx, _ohpx,
+                 seq, whole, budget))
+        tw, th = _twpx // 16, _thpx // 16
+        ol_w, ol_h = _owpx // 16, _ohpx // 16
+
+    elif mode == "rows_cols":
+        _gr = max(1, int(sp.get("grid_rows") or 1))
+        _gc = max(1, int(sp.get("grid_cols") or 1))
+        _twpx, _owpx = _solve_equal_tiles_ld(w * 16, _gc, ol_w * 16, 32)
+        _thpx, _ohpx = _solve_equal_tiles_ld(h * 16, _gr, ol_h * 16, 32)
+        if _twpx < min_tile * 16 or _thpx < min_tile * 16:
+            raise ValueError(
+                "rows_cols: a %dx%d grid over the real %dx%dpx frame solves to "
+                "%dx%dpx tiles, below min_tile_size (%dpx). Ask for fewer "
+                "rows/cols, raise the megapixel target, or lower min_tile_size."
+                % (_gr, _gc, w * 16, h * 16, _twpx, _thpx, min_tile * 16))
+        print("[MMH3] rows_cols solved on the real frame %dx%dpx: %dx%d grid, "
+              "tiles %dx%dpx, overlap w=%d h=%d | %d tokens per forward"
+              % (w * 16, h * 16, _gr, _gc, _twpx, _thpx, _owpx, _ohpx,
+                 tokens_per_forward(_twpx, _thpx, t)))
+        tw, th = _twpx // 16, _thpx // 16
+        ol_w, ol_h = _owpx // 16, _ohpx // 16
+
+    if tw is None:
+        return None, None, ol_w, ol_h
+    return tw, th, ol_w, ol_h
+
+
 def crop_keyframes_to_tile(cond, src_h, src_w, r0, c0, tr, tc):
     """Spatially crop every keyframe's video latent to a tile of the source frame.
 
@@ -835,6 +986,215 @@ def temporal_append(acc_v, acc_a, chunk_v, chunk_a, index, k0, f0):
     return result_v, result_a
 
 
+class _PreparedNoise:
+    """Hands back a noise tensor that was made earlier, instead of a new one.
+
+    WHY THIS EXISTS - THE SEAM.
+
+    Every tile used to call noise.generate_noise(its own latent), which is
+    comfy.sample.prepare_noise(shape, seed). The seed is the same for all of
+    them, but torch.randn fills a tensor ROW-MAJOR from the generator's
+    stream, so the value that lands at a given spatial position depends on the
+    tensor's WIDTH. Two tiles that overlap have different widths and different
+    offsets, so for one picture position inside the shared band, tile A reads
+    stream index y*W_A + x while tile B reads y*W_B + (x - offset). Those are
+    unrelated numbers.
+
+    The consequence is not subtle: the two tiles denoise the SAME region from
+    DIFFERENT noise, converge on two different pictures, and the stitcher then
+    cross-fades between them. That is a seam by construction. Overlap width,
+    fade length and blend curve all act downstream of it, which is why tuning
+    them can soften the edge but never remove it.
+
+    The fix is to make the noise a property of the CHUNK rather than of the
+    tile: draw one field at the chunk's full size, then hand each tile the
+    slice that sits under it. Both tiles then see identical noise where they
+    overlap and, given the same conditioning and the same schedule, converge on
+    very nearly the same picture there - so the blend is joining two views of
+    one image rather than two different images.
+
+    This is the same reason a tiled VAE decode has no seams: it is
+    deterministic, so neighbouring tiles cannot disagree.
+    """
+
+    def __init__(self, seed, noise):
+        self.seed = seed
+        self._noise = noise
+
+    def generate_noise(self, input_latent):
+        return self._noise
+
+
+def _feather_mask(tr, tc, ovh, ovw, top, left, bottom, right, device, dtype):
+    """A tile's weight in the accumulator: 1 in the middle, ramping to 0 on any
+    edge that has a neighbour. Straight out of comfy.utils.tiled_scale_multidim,
+    which is what a tiled VAE decode uses - the same bookkeeping, applied to a
+    model prediction instead of a finished tile.
+    """
+    # COSINE, NOT LINEAR. A linear ramp meets 1.0 with a kink - the weight is
+    # continuous but its slope is not, and that discontinuity is visible as a
+    # faint line at the inner edge of the band. A raised cosine leaves at zero
+    # slope and arrives at zero slope. TenStrip's LTX tiled sampler uses the
+    # same window and its changelog records the same hunt, which is decent
+    # evidence it is worth the two extra lines.
+    def ramp(n, rising):
+        i = torch.arange(n, device=device, dtype=dtype)
+        w = 0.5 * (1.0 - torch.cos(math.pi * i / n))
+        return w if rising else torch.flip(w, (0,))
+
+    m = torch.ones((tr, tc), device=device, dtype=dtype)
+    if left and ovw > 0:
+        m[:, :ovw] *= ramp(min(ovw, tc), True)[None, :]
+    if right and ovw > 0:
+        m[:, -ovw:] *= ramp(min(ovw, tc), False)[None, :]
+    if top and ovh > 0:
+        m[:ovh, :] *= ramp(min(ovh, tr), True)[:, None]
+    if bottom and ovh > 0:
+        m[-ovh:, :] *= ramp(min(ovh, tr), False)[:, None]
+    return m
+
+
+class _ZeroNoise:
+    """No noise. Every step after the first starts from the latent as it is."""
+
+    def __init__(self, seed):
+        self.seed = seed
+
+    def generate_noise(self, input_latent):
+        t = input_latent["samples"]
+        if hasattr(t, "tensors"):
+            return comfy.nested_tensor.NestedTensor(
+                tuple(torch.zeros_like(x) for x in t.tensors))
+        return torch.zeros_like(t)
+
+
+def spatial_process_joint(chunk_v, chunk_a, cond, sp, model, noise, sampler,
+                          sigmas, negative, cfg):
+    """Tiles that are stepped TOGETHER instead of finished one at a time.
+
+    WHY THIS EXISTS.
+
+    A tiled VAE decode has no seams, and it is worth being precise about why:
+    its per-tile function is a single deterministic pass, so two tiles that
+    overlap compute the SAME pixels twice and the feathered accumulator simply
+    reconstructs them. The mask is bookkeeping, not repair.
+
+    spatial_process() borrows that accumulator but hands it a whole denoising
+    TRAJECTORY per tile. A trajectory is not deterministic across tiles: the
+    same latent patch sits at the edge of one tile and in the middle of
+    another, so the transformer sees different neighbours and returns different
+    content. The accumulator is then averaging two different pictures, and a
+    blend between two different pictures is a seam. That is why widening the
+    overlap, lengthening the fade or changing the curve only ever softened it.
+
+    So this keeps comfy's accumulator exactly and changes what is accumulated:
+    ONE forward per tile per step, merged into ONE latent, stepped once. A
+    single forward is near enough deterministic given the same input, which is
+    the property the decode has and a trajectory does not. Tiles are
+    re-synchronised after every step, so they never get the chance to diverge.
+
+    Cost is the same as before - tiles x steps forwards, one tile of
+    activations at a time. What changes is that the tiles are solving one
+    problem together rather than N problems separately.
+    """
+    tw = int(sp["tile_width"]) // 16
+    th = int(sp["tile_height"]) // 16
+    ol_w = int(sp["spatial_w_overlap"]) // 16
+    ol_h = int(sp["spatial_h_overlap"]) // 16
+    min_tile = int(sp["min_tile_size"]) // 16
+    if tw <= 0 or th <= 0:
+        raise ValueError("tile_width/tile_height must be multiples of 32 pixels")
+    if ol_w >= tw or ol_h >= th:
+        raise ValueError("overlap must be smaller than the tile")
+
+    _, c, t, h, w = chunk_v.shape
+
+    # Re-solve the grid against the frame in hand; see
+    # resolve_grid_on_frame() for why the params node cannot.
+    _tw, _th, ol_w, ol_h = resolve_grid_on_frame(
+        sp, w, h, t, ol_w, ol_h, min_tile)
+    if _tw is not None:
+        tw, th = _tw, _th
+    rows, cols, trows, tcols, row_ovl, col_ovl = compute_spatial_grid(
+        h, w, th, tw, ol_h, ol_w, min_tile, min_tile)
+    odd = ([x * 16 for x in tcols if x % 2] + [x * 16 for x in trows if x % 2])
+    if odd:
+        raise ValueError(
+            "Tile grid produced an extent that is not a multiple of 32px: %s. "
+            "H3 patchifies 2x2 latent tokens." %
+            ", ".join("%dpx" % v for v in sorted(set(odd))))
+
+    nrows, ncols = len(rows), len(cols)
+    ta = chunk_a.shape[-1]
+    dev, dt = chunk_v.device, chunk_v.dtype
+    seed = getattr(noise, "seed", 0)
+
+    # ONE noise field for the chunk, sliced per tile - so the region two tiles
+    # share starts from identical noise as well as identical latent.
+    try:
+        base = comfy.sample.prepare_noise(
+            comfy.nested_tensor.NestedTensor((chunk_v, chunk_a)), seed)
+        nv_full, na_full = base.tensors[0], base.tensors[1]
+    except Exception as e:
+        raise RuntimeError("could not draw the chunk noise field: %s" % e)
+
+    # cond and mask per tile, built once rather than per step
+    tiles = []
+    for i in range(nrows):
+        for j in range(ncols):
+            r0, c0, tr, tc = rows[i], cols[j], trows[i], tcols[j]
+            m = _feather_mask(tr, tc, row_ovl[i] or ol_h, col_ovl[j] or ol_w,
+                              top=(i > 0), left=(j > 0),
+                              bottom=(i < nrows - 1), right=(j < ncols - 1),
+                              device=dev, dtype=torch.float32)
+            tiles.append({
+                "r0": r0, "c0": c0, "tr": tr, "tc": tc,
+                "cond": crop_keyframes_to_tile(cond, h, w, r0, c0, tr, tc),
+                "mask": m[None, None, None],
+            })
+    print("[MMH3] joint tiling: %dx%d = %d tiles, %d step(s), stepped together"
+          % (nrows, ncols, len(tiles), max(1, len(sigmas) - 1)))
+
+    x = chunk_v
+    zero = _ZeroNoise(seed)
+    audio_out = chunk_a
+    # audio is never tiled and never re-sampled: it is frozen in every piece,
+    # exactly as the sequential path froze it.
+    ma = torch.zeros((1, 32, 2, ta), device=chunk_a.device, dtype=chunk_a.dtype)
+
+    for step in range(len(sigmas) - 1):
+        two = sigmas[step:step + 2]
+        acc = torch.zeros_like(x, dtype=torch.float32)
+        wsum = torch.zeros((1, 1, 1, x.shape[3], x.shape[4]),
+                           device=dev, dtype=torch.float32)
+        for td in tiles:
+            r0, c0, tr, tc = td["r0"], td["c0"], td["tr"], td["tc"]
+            xt = x[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
+            mv = torch.ones((1, 1, 1, tr, tc), device=dev, dtype=torch.float32)
+            piece = {
+                "samples": comfy.nested_tensor.NestedTensor((xt, audio_out)),
+                "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma)),
+            }
+            if step == 0:
+                nv = nv_full[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
+                n = _PreparedNoise(seed, comfy.nested_tensor.NestedTensor(
+                    (nv, na_full)))
+            else:
+                n = zero
+            out = sample_piece(piece, td["cond"], model, n, sampler, two,
+                               negative, cfg)
+            ot = out.tensors[0].to(device=dev, dtype=torch.float32)
+            acc[:, :, :, r0:r0 + tr, c0:c0 + tc] += ot * td["mask"]
+            wsum[:, :, :, r0:r0 + tr, c0:c0 + tc] += td["mask"][:, :, 0]
+        x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+
+    info = {"rows": rows, "cols": cols, "tile_rows": trows, "tile_cols": tcols,
+            "row_overlaps": row_ovl, "col_overlaps": col_ovl,
+            "orig_h": h, "orig_w": w, "joint": True,
+            "steps": max(1, len(sigmas) - 1), "tiles": len(tiles)}
+    return x, info
+
+
 def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, negative, cfg,
                     fun_control=None, inpaint=None):
     """Inner loop: spatial split -> per-tile sampling -> spatial stitch.
@@ -861,6 +1221,10 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
         raise ValueError("min_tile_size must not exceed the tile size")
 
     _, c, t, h, w = chunk_v.shape
+    # Grid modes must use the actual chunk, which may differ from the parameter preview.
+    _tw, _th, ol_w, ol_h = resolve_grid_on_frame(sp, w, h, t, ol_w, ol_h, min_tile)
+    if _tw is not None:
+        tw, th = _tw, _th
     rows, cols, trows, tcols, row_ovl, col_ovl = compute_spatial_grid(h, w, th, tw, ol_h, ol_w, min_tile, min_tile)
     nrows, ncols = len(rows), len(cols)
     ta = chunk_a.shape[-1]
@@ -873,6 +1237,14 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
         "tile_rows": trows, "tile_cols": tcols, "n_cols": ncols,
         "orig_h": h, "orig_w": w, "overlap_mode": overlap_mode, "overlap_blend": overlap_blend,
     }
+
+    seed = getattr(noise, "seed", 0)
+    tiled_noise = None
+    try:
+        base = comfy.sample.prepare_noise(comfy.nested_tensor.NestedTensor((chunk_v, chunk_a)), seed)
+        tiled_noise = (base.tensors[0], base.tensors[1])
+    except Exception as exc:
+        print("[MMH3] Shared tile noise unavailable; using per-tile noise: %s" % exc)
 
     for i in range(nrows):
         for j in range(ncols):
@@ -945,8 +1317,14 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                 video_flat=math.prod(tile.shape[1:]), mn=mn)
             if dynamic is not None:
                 model.set_model_denoise_mask_function(dynamic)
+            tile_noise = noise
+            if tiled_noise is not None:
+                nv = tiled_noise[0][:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
+                if tr_s != tr or tc_s != tc:
+                    nv = F.pad(nv, (0, tc_s - tc, 0, tr_s - tr))
+                tile_noise = _PreparedNoise(seed, comfy.nested_tensor.NestedTensor((nv, tiled_noise[1])))
             try:
-                out = sample_piece(piece, cond_tile, model, noise, sampler, sigmas, negative, cfg)
+                out = sample_piece(piece, cond_tile, model, tile_noise, sampler, sigmas, negative, cfg)
             finally:
                 if dynamic is not None:
                     model.model_options.pop("denoise_mask_function", None)
@@ -1145,11 +1523,11 @@ class MMH3SpatialSplitParams(io.ComfyNode):
             search_aliases=["h3 spatial params", "spatial split param", "tile param"],
             inputs=[
                 io.Int.Input("upscale_width", default=1024, min=32, max=100000, step=32,
-                             tooltip="[rows_cols mode] Overall upscaled frame WIDTH in PIXELS that gets split into grid_cols equal-size tile columns. Must be a multiple of 32 and must match the width set in 'MMH3 Latent Upscale Params'. Ignored in specific_size mode."),
+                             tooltip="NOT USED. The tile grid is solved against the frame actually produced by the upscale, at sampling time, in every mode - so this widget cannot go stale and does not need to match anything. Kept only so saved workflows keep their widget positions."),
                 io.Int.Input("upscale_height", default=1024, min=32, max=100000, step=32,
-                             tooltip="[rows_cols mode] Overall upscaled frame HEIGHT in PIXELS that gets split into grid_rows equal-size tile rows. Must be a multiple of 32 and must match the height set in 'MMH3 Latent Upscale Params'. Ignored in specific_size mode."),
-                io.Combo.Input("tile_size_mode", options=["specific_size", "rows_cols"], default="specific_size",
-                               tooltip="How the tile size is determined. 'specific_size' (default): use tile_width/tile_height below. 'rows_cols': split the frame given by upscale_width/upscale_height into grid_rows x grid_cols EQUAL-SIZE tiles (edge tiles included) - the per-axis overlap is auto-solved so every tile ends up exactly the same size; errors out if the solved tiles would be smaller than min_tile_size."),
+                             tooltip="NOT USED. See upscale_width. Kept only so saved workflows keep their widget positions."),
+                io.Combo.Input("tile_size_mode", options=["specific_size", "rows_cols", "auto"], default="specific_size",
+                               tooltip="How the tile size is determined. 'specific_size' (default): use tile_width/tile_height below. 'rows_cols': split the frame into grid_rows x grid_cols EQUAL-SIZE tiles (edge tiles included) - the per-axis overlap is auto-solved so every tile ends up exactly the same size; errors out if the solved tiles would be smaller than min_tile_size. 'auto': solve the grid from token_budget on the REAL frame - the fewest equal tiles whose per-tile forward fits the budget, preferring strips on the long axis. In 'auto' the megapixel dial moves freely and the tile count follows it; grid_rows/grid_cols and tile_width/tile_height are ignored. Both 'rows_cols' and 'auto' resolve at sampling time against the frame actually in hand, so upscale_width/height below are not used."),
                 io.Int.Input("tile_width", default=512, min=32, max=100000, step=32,
                              tooltip="[specific_size mode] Tile width in PIXELS at the (upscaled) chunk resolution. Must be a multiple of 32."),
                 io.Int.Input("tile_height", default=512, min=32, max=100000, step=32,
@@ -1159,9 +1537,9 @@ class MMH3SpatialSplitParams(io.ComfyNode):
                 io.Int.Input("grid_cols", default=2, min=1, max=9, step=1,
                              tooltip="[rows_cols mode] Number of tile COLUMNS along the width axis (1-9)."),
                 io.Int.Input("spatial_w_overlap", default=128, min=0, max=100000, step=32,
-                             tooltip="Horizontal overlap in PIXELS between neighbouring tiles. Must be a multiple of 32 and smaller than the tile width. In rows_cols mode this is the DESIRED overlap; the node auto-solves the actual value (multiple of 16px, the H3 latent token) so all tiles stay equal. If the solved tile size would not be a multiple of 32 (the model's 2x2 latent patch grid, which eliminates seams), the overlap is automatically increased by 32px and the tiles re-solved at the next valid 32px grid alignment."),
+                             tooltip="Horizontal overlap in PIXELS between neighbouring tiles. Must be a multiple of 32 and smaller than the tile width. In rows_cols mode this is the DESIRED overlap; the node auto-solves the actual value (multiple of 16px, the H3 latent token) so all tiles stay equal."),
                 io.Int.Input("spatial_h_overlap", default=128, min=0, max=100000, step=32,
-                             tooltip="Vertical overlap in PIXELS between neighbouring tiles. Must be a multiple of 32 and smaller than the tile height. In rows_cols mode this is the DESIRED overlap; the node auto-solves the actual value (multiple of 16px, the H3 latent token) so all tiles stay equal. If the solved tile size would not be a multiple of 32 (the model's 2x2 latent patch grid, which eliminates seams), the overlap is automatically increased by 32px and the tiles re-solved at the next valid 32px grid alignment."),
+                             tooltip="Vertical overlap in PIXELS between neighbouring tiles. Must be a multiple of 32 and smaller than the tile height. In rows_cols mode this is the DESIRED overlap; the node auto-solves the actual value (multiple of 16px, the H3 latent token) so all tiles stay equal."),
                 io.Int.Input("fade_width", default=32, min=0, max=100000, step=32,
                              tooltip="Width in PIXELS of the FADE segment (mask 0->1) at the interior edge of the overlap band. The overlap band splits into a FROZEN segment (seam side, mask=0, keeps the neighbour's content) + this FADE segment (interior side). fade_width sets the fade length; the frozen segment takes the rest (overlap - fade). Default 32. Set to 0 to freeze the entire overlap strip. Clamped to the solved overlap in rows_cols mode."),
                 io.Int.Input("fade_height", default=32, min=0, max=100000, step=32,
@@ -1180,6 +1558,10 @@ class MMH3SpatialSplitParams(io.ComfyNode):
                                tooltip="Temporal fade schedule over each tile's sampling. 'off' (default): the FADE segment keeps its fixed width for the whole tile (current behaviour). 'narrowing': the fade width starts at fade_width/fade_height and shrinks linearly to dynamic_fade_min by the end of the tile. 'widening': it starts at dynamic_fade_min and grows linearly to fade_width/fade_height. Only takes effect when the tile is sampled in more than one step; if a per-axis fade is not larger than dynamic_fade_min it behaves like 'off'."),
                 io.Int.Input("dynamic_fade_min", default=32, min=0, max=100000, step=32,
                              tooltip="Minimum width (PIXELS) the FADE segment can reach when dynamic_fade is 'narrowing' or 'widening'. Only effective when a per-axis fade is larger than this; otherwise the fade stays at its static width. Default 32."),
+                io.Boolean.Input("joint_steps", default=True,
+                                 tooltip="Step every tile TOGETHER through each sampling step and merge them into one latent, instead of finishing each tile alone and blending the results. On: merge tiles at every step to reduce divergence. Off: sample tiles sequentially. ControlNet, inpainting, and sequential fade/brightness controls use sequential sampling."),
+                io.Int.Input("token_budget", default=70000, min=4096, max=1000000, step=1024,
+                             tooltip="[auto mode] Largest sequence length allowed in ONE tile forward, in tokens. A tile of W x H pixels over a chunk of N video latent tokens is (W/32) * (H/32) * N. The INT8-Fast kernels fault with an illegal memory access above ~74,898, and attention cost is ~quadratic below it, so this is both the crash line and the speed dial. 70000 leaves a margin under the ceiling; lower it for faster steps and more tiles, raise it for fewer, larger tiles. Ignored in the other two modes."),
             ],
             outputs=[
                 H3_SPATIAL_PARAM.Output("spatial_split_param",
@@ -1195,44 +1577,78 @@ class MMH3SpatialSplitParams(io.ComfyNode):
     def execute(cls, upscale_width, upscale_height, tile_size_mode, tile_width,
                 tile_height, grid_rows, grid_cols,
                 spatial_w_overlap, spatial_h_overlap,
-                 fade_width, fade_height, min_tile_size, overlap_mode,
-                 overlap_blend, masked_area_noise, brightness_match,
-                 dynamic_fade, dynamic_fade_min) -> io.NodeOutput:
-        if tile_size_mode == "rows_cols":
-            # Equal-size grid solved HERE so the tile outputs are always real:
-            # split upscale_width/height into grid_cols x grid_rows tiles of
-            # exactly equal size (edges included). Overlap granularity is one
-            # latent token: 16px for MiniMax H3.
-            for name, v in (("upscale_width", upscale_width), ("upscale_height", upscale_height)):
-                if v <= 0 or v % 32 != 0:
-                    raise ValueError(f"'{name}' must be a positive multiple of 32 pixels; got {v}.")
-            tw, ow = _solve_equal_tiles(upscale_width, grid_cols, spatial_w_overlap, 16)
-            th, oh = _solve_equal_tiles(upscale_height, grid_rows, spatial_h_overlap, 16)
-            if tw < min_tile_size or th < min_tile_size:
-                raise ValueError(
-                    f"rows_cols mode: solved tile size is {th}x{tw}px "
-                    f"(grid {grid_rows}x{grid_cols} over {upscale_height}x{upscale_width}px), "
-                    f"which is smaller than min_tile_size ({min_tile_size}px). "
-                    f"Reduce grid_rows/grid_cols, or lower min_tile_size to at most "
-                    f"{min(tw, th)}px.")
+                fade_width, fade_height, min_tile_size, overlap_mode,
+                overlap_blend, masked_area_noise=0.0, brightness_match=False,
+                dynamic_fade="off", dynamic_fade_min=32, joint_steps=True, token_budget=70000) -> io.NodeOutput:
+        if tile_size_mode == "auto":
+            # Nothing to solve yet: the grid comes from the frame the upscale
+            # actually produces, which does not exist until sampling. Carry the
+            # budget through and hand back placeholder tiles that satisfy the
+            # downstream sanity checks (overlap < tile) and nothing more.
+            for name, v in (("spatial_w_overlap", spatial_w_overlap),
+                            ("spatial_h_overlap", spatial_h_overlap),
+                            ("min_tile_size", min_tile_size)):
+                if v % 32 != 0:
+                    raise ValueError(f"'{name}' must be a multiple of 32 pixels (the model's 2x2 latent patch grid); got {v}.")
+            ph_w = max(spatial_w_overlap + 32, min_tile_size, 512)
+            ph_h = max(spatial_h_overlap + 32, min_tile_size, 512)
             param = {
-                "tile_width": tw, "tile_height": th,
-                "spatial_w_overlap": ow, "spatial_h_overlap": oh,
-                "fade_width": min(fade_width, ow),
-                "fade_height": min(fade_height, oh),
+                "tile_width": ph_w, "tile_height": ph_h,
+                "spatial_w_overlap": spatial_w_overlap,
+                "spatial_h_overlap": spatial_h_overlap,
+                "fade_width": min(fade_width, spatial_w_overlap),
+                "fade_height": min(fade_height, spatial_h_overlap),
                 "min_tile_size": min_tile_size,
                 "overlap_mode": overlap_mode, "overlap_blend": overlap_blend,
-                "tile_size_mode": tile_size_mode,
+                "tile_size_mode": tile_size_mode, "joint_steps": joint_steps,
+                "token_budget": int(token_budget),
+                "masked_area_noise": masked_area_noise, "brightness_match": brightness_match,
+                "dynamic_fade": dynamic_fade, "dynamic_fade_min": dynamic_fade_min,
+            }
+            print(f"[MMH3 Spatial Split Params] auto mode: grid solved at "
+                  f"sampling time for <= {int(token_budget)} tokens per tile "
+                  f"forward (desired overlap h={spatial_h_overlap} "
+                  f"w={spatial_w_overlap}, min tile {min_tile_size}px). "
+                  f"tile_width/tile_height outputs are placeholders.")
+            return io.NodeOutput(param, ph_w, ph_h)
+
+        if tile_size_mode == "rows_cols":
+            # The SHAPE is the setting; the tile size that realises it depends on
+            # the frame, which does not exist yet. Solving it here from
+            # upscale_width/height made those two widgets a promise about an
+            # unseen frame, and a stale promise fails: 3x1 asked for, 7x2
+            # delivered, and later a hard stop when the real frame was smaller
+            # than the promised tile. So carry the shape and resolve it in
+            # spatial_process*(), where the actual chunk is in hand.
+            for name, v in (("spatial_w_overlap", spatial_w_overlap),
+                            ("spatial_h_overlap", spatial_h_overlap),
+                            ("min_tile_size", min_tile_size)):
+                if v % 32 != 0:
+                    raise ValueError(f"'{name}' must be a multiple of 32 pixels (the model's 2x2 latent patch grid); got {v}.")
+            if grid_rows < 1 or grid_cols < 1:
+                raise ValueError("grid_rows and grid_cols must be at least 1")
+            ph_w = max(spatial_w_overlap + 32, min_tile_size, 512)
+            ph_h = max(spatial_h_overlap + 32, min_tile_size, 512)
+            param = {
+                "tile_width": ph_w, "tile_height": ph_h,
+                "spatial_w_overlap": spatial_w_overlap,
+                "spatial_h_overlap": spatial_h_overlap,
+                "fade_width": min(fade_width, spatial_w_overlap),
+                "fade_height": min(fade_height, spatial_h_overlap),
+                "min_tile_size": min_tile_size,
+                "overlap_mode": overlap_mode, "overlap_blend": overlap_blend,
+                "tile_size_mode": tile_size_mode, "joint_steps": joint_steps,
                 "grid_rows": grid_rows, "grid_cols": grid_cols,
-                "masked_area_noise": masked_area_noise,
-                "brightness_match": brightness_match,
-                "dynamic_fade": dynamic_fade,
-                "dynamic_fade_min": dynamic_fade_min,
+                "token_budget": int(token_budget),
+                "masked_area_noise": masked_area_noise, "brightness_match": brightness_match,
+                "dynamic_fade": dynamic_fade, "dynamic_fade_min": dynamic_fade_min,
             }
             print(f"[MMH3 Spatial Split Params] rows_cols mode: {grid_rows}x{grid_cols} "
-                  f"tiles of {th}x{tw}px over {upscale_height}x{upscale_width}px "
-                  f"(overlap h={oh} w={ow}, fade h={param['fade_height']} w={param['fade_width']})")
-            return io.NodeOutput(param, tw, th)
+                  f"grid, tiles solved at sampling time against the real frame "
+                  f"(desired overlap h={spatial_h_overlap} w={spatial_w_overlap}, "
+                  f"min tile {min_tile_size}px). upscale_width/upscale_height are "
+                  f"not used; tile_width/tile_height outputs are placeholders.")
+            return io.NodeOutput(param, ph_w, ph_h)
 
         for name, v in (("tile_width", tile_width), ("tile_height", tile_height),
                         ("spatial_w_overlap", spatial_w_overlap), ("spatial_h_overlap", spatial_h_overlap),
@@ -1261,10 +1677,10 @@ class MMH3SpatialSplitParams(io.ComfyNode):
             "overlap_mode": overlap_mode,
             "overlap_blend": overlap_blend,
             "tile_size_mode": tile_size_mode,
-            "masked_area_noise": masked_area_noise,
-            "brightness_match": brightness_match,
-            "dynamic_fade": dynamic_fade,
-            "dynamic_fade_min": dynamic_fade_min,
+            "joint_steps": joint_steps,
+            "token_budget": int(token_budget),
+                "masked_area_noise": masked_area_noise, "brightness_match": brightness_match,
+                "dynamic_fade": dynamic_fade, "dynamic_fade_min": dynamic_fade_min,
         }
         return io.NodeOutput(param, tile_width, tile_height)
 
@@ -1495,7 +1911,8 @@ class MMH3UltimateUpscale(io.ComfyNode):
         # fail early if the upscale target is smaller than the spatial tile size;
         # tiles can never cover a chunk smaller than one tile, which would only
         # surface as a confusing error during the sampling/stitching phase.
-        if latent_upscale_param is not None and spatial_split_param is not None:
+        if (latent_upscale_param is not None and spatial_split_param is not None
+                and spatial_split_param.get("tile_size_mode") not in ("rows_cols", "auto")):
             up_w = int(latent_upscale_param["width"])
             up_h = int(latent_upscale_param["height"])
             tile_w = int(spatial_split_param["tile_width"])
@@ -1585,11 +2002,24 @@ class MMH3UltimateUpscale(io.ComfyNode):
                 fun_control["chunk_ctrl"] = chunk_ctrl
                 fun_control["mode"] = fc_mode
             if spatial_split_param is not None:
-                chunk_out_v, tile_info = spatial_process(
-                    chunk_v, chunk_a, cond_i, spatial_split_param,
-                    model, noise, sampler, sigmas, negative, cfg,
-                    fun_control=fun_control, inpaint=inpaint_param,
-                )
+                # These upstream controls operate on sequential tiles and cannot be
+                # represented by the LD joint sampler; retain their behavior.
+                sequential_controls = (fun_control is not None or inpaint_param is not None
+                    or spatial_split_param.get("masked_area_noise", 0.0) != 0.0
+                    or spatial_split_param.get("brightness_match", False)
+                    or spatial_split_param.get("dynamic_fade", "off") != "off")
+                joint = spatial_split_param.get("joint_steps", True) and not sequential_controls
+                if spatial_split_param.get("joint_steps", True) and sequential_controls:
+                    print("[MMH3] Using sequential tiles for ControlNet, inpaint, or sequential fade/brightness controls")
+                if joint:
+                    chunk_out_v, tile_info = spatial_process_joint(
+                        chunk_v, chunk_a, cond_i, spatial_split_param,
+                        model, noise, sampler, sigmas, negative, cfg)
+                else:
+                    chunk_out_v, tile_info = spatial_process(
+                        chunk_v, chunk_a, cond_i, spatial_split_param,
+                        model, noise, sampler, sigmas, negative, cfg,
+                        fun_control=fun_control, inpaint=inpaint_param)
                 tile_info = dict(tile_info)
                 tile_info["chunk"] = i
                 tiles_debug.append(tile_info)
